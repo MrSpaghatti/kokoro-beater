@@ -58,6 +58,19 @@ bin/kokoro-beater "Hello, world!" --voice af_bella --out hello.wav
 `KOKORO_MODELS` (dir with `kokoro-v1.0.onnx` + `voices-v1.0.bin`),
 `KOKORO_ONNX_LIB`, `KOKORO_ESPEAK_LIB`, `KOKORO_ESPEAK_DATA`, `KB_DEBUG=1`.
 
+## Runtime deps (NOT in git, ~44MB)
+
+To keep the repo light for remote agents, these heavy runtime files are
+gitignored but expected on disk next to the binary (bin/../vendor/):
+
+- `libonnxruntime.so.1.28.0` (24MB) — copy from
+  `~/Downloads/audiobook/.venv/lib/python3.12/site-packages/onnxruntime/capi/`
+- `libespeak-ng.so.1.52.0` + `espeak-ng-data/` (19MB) — copy from
+  `~/Downloads/audiobook/.venv/lib/python3.12/site-packages/espeakng_loader/`
+
+The C headers (`vendor/onnxruntime_*.h`) ARE in git — only the binaries are
+excluded. `kb_ort.c` + the header live in git so the shim still compiles.
+
 ## Build
 
 ```
