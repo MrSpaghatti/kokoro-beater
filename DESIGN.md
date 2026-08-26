@@ -34,8 +34,12 @@ rules layer on top of espeak. Port its core to Nim:
   under the rules — misaki still calls espeak for unknown words.
 - New CLI flag `--g2p misaki` (default), `--g2p espeak` for legacy parity.
 - Success: the misaki phoneme string for `"boogeyman any more"` matches
-  misaki's python output byte-for-byte, and `--g2p misaki` **speaks the word
-  correctly** (verifiable by transcribing the wav).
+  `tests/fixtures/misaki_phonemes.txt` byte-for-byte, and `--g2p misaki`
+  **speaks the word correctly** (verifiable by transcribing the wav).
+- Reference signature (misaki 0.9.4, verified): `en.G2P(version='0.2.0')` —
+  NO `lit`/`trf` kwargs in this version (the old `lit=True` calls are stale).
+  Unknown words emit the `❓` glyph (`unk='❓'`); the model's vocab filter
+  drops it, matching kokoro-onnx behavior.
 
 ### 2. Unlimited voices — style-space interpolation/extrapolation
 
@@ -82,25 +86,47 @@ exposes the second half. In Nim:
 - Goal: `startup_ms` under ~350ms, RTF ≤ 0.16 on 12 cores, long-form
   (≥1h audio) with memory flat.
 
-## Verification (run these yourself before reporting done)
+## Verification (run these in the repo; fixtures make it self-contained)
+
+Fixture files (checked in, generated from the reference implementations):
+- `tests/fixtures/espeak_phonemes.txt` — kokoro-onnx `tokenizer.phonemize` output for
+  three test strings (the byte-exact legacy target).
+- `tests/fixtures/misaki_phonemes.txt` — misaki `en.G2P` output for the same strings
+  (the byte-exact misaki target).
+- `tests/fixtures/reference.wav` — kokoro-onnx `create("Hello, world! This is a test
+  for kokoro.", "af_bella")` 16-bit mono 24 kHz (the bit-exact audio target).
 
 ```bash
-cd /home/spag/Downloads/audiobook    # has .venv with kokoro-onnx + misaki
-# 1. misaki parity — python side:
-NIM_EXE=/home/spag/hermes/nim/kokoro-beater/bin/kokoro-beater
-"$NIM_EXE" --g2p espeak  --phonemes "boogeyman any more"   # legacy
-# must equal:  python -c 'from kokoro_onnx import Kokoro; k=Kokoro(...); print(k.tokenizer.phonemize("boogeyman any more"))'
-"$NIM_EXE" --g2p misaki  --phonemes "boogeyman any more"   # misaki-grade
-# must equal:  python misaki en.G2P output for those words
-# 2. audio regression:
-"$NIM_EXE" --g2p espeak "Hello, world! This is a test for kokoro." --out /tmp/reg.wav
-# compare vs python ref (existing script ~/.hermes/scripts/kb_cmp.sh) — corr must be 1.000000
-# 3. voice blend:
-"$NIM_EXE" --voice '0.5*af_bella+0.5*am_onyx' "Hi there" --out /tmp/blend.wav --json
-# 4. emotion:
-"$NIM_EXE" --emotion cheerful "I can hardly believe it" --out /tmp/emo.wav --json
-# vs baseline, must differ but transcribe the same
+NIM=./bin/kokoro-beater
+# 1. legacy espeak parity — phonemes must equal the fixture value exactly
+"$NIM" --g2p espeak --phonemes "$(head -1 <(cut -f2 tests/fixtures/espeak_phonemes.txt))" --out /tmp/esp.wav
+#    or compare key strings: the `misread` line must equal the fixture
+MISREAD=$(grep -P '^misread\t' tests/fixtures/espeak_phonemes.txt | cut -f2)
+[ "$("$NIM" --g2p espeak --phonemes 'boogeyman any more' 2>&1 | grep -oP 'PHONEMES: \K.*')" = "$MISREAD" ]
+
+# 2. audio regression — compare to the checked-in reference wav
+"$NIM" --g2p espeak "Hello, world! This is a test for kokoro." --out /tmp/reg.wav
+#    correlation vs tests/fixtures/reference.wav must be 1.000000
+#    (python: numpy corrcoef on int16→float — same length, same samples)
+
+# 3. misaki G2P — phonemes must equal tests/fixtures/misaki_phonemes.txt (`misaki` line)
+"$NIM" --g2p misaki --phonemes "boogeyman any more"
+#    and must DIFFER from the espeak fixture (that difference is the whole point)
+
+# 4. voice blend
+"$NIM" --voice '0.5*af_bella+0.5*am_onyx' "Hi there" --out /tmp/blend.wav --json
+#    audio must exist, RMS within 2x either parent
+
+# 5. emotion — differs from baseline but transcribes the same words
+"$NIM" --emotion cheerful "I can hardly believe it" --out /tmp/emo.wav --json
+"$NIM"                      "I can hardly believe it" --out /tmp/base.wav --json
+#    corr(emo, base) < 0.99
 ```
+
+The audio correlation check needs a tiny helper; a Nim test at `tests/corr.nim` (or a
+`tests/verify.sh` using `python3` only if a system python is present — prefer pure Nim)
+is acceptable. Keep ALL verification commands relative to the repo — no absolute
+paths, no dependence on `~/Downloads/audiobook` (that dir does not exist in CI).
 
 ## Deliverables
 
