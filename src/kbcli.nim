@@ -18,7 +18,7 @@
 ## streamed straight to the output file — no in-memory ceiling.
 
 import std/[os, strutils, streams, times, math, json, algorithm, posix]
-import ./espeak, ./vocab, ./npz, ./onnx, ./trim, ./phonemize
+import ./espeak, ./vocab, ./npz, ./onnx, ./trim, ./phonemize, ./misaki_g2p, ./voiceforge, ./emotion
 
 const
   SampleRate = 24000
@@ -41,6 +41,9 @@ type
     espeakLib: string
     espeakData: string
     listOnly: bool
+    g2p: string
+    emotion: string
+    styleOffset: float
 
   WavWriter = object
     f: File
@@ -66,7 +69,7 @@ proc defaultPaths(): tuple[model: string, voices: string] =
 
 proc parseArgs(): Config =
   result = Config(voice: "af_bella", outFile: "out.wav", speed: 1.0,
-                  trim: true, pauses: true)
+                  trim: true, pauses: true, g2p: "misaki", styleOffset: 1.0)
   let argv = commandLineParams()
   var positionals: seq[string]
   var i = 0
@@ -74,7 +77,7 @@ proc parseArgs(): Config =
     let a = argv[i]
     case a
     of "--voice", "--out", "--speed", "--threads", "--model", "--voices",
-       "--espeak-lib", "--espeak-data":
+       "--espeak-lib", "--espeak-data", "--g2p", "--emotion", "--style-offset":
       if i + 1 >= argv.len:
         quit("missing value for " & a)
       case a
@@ -86,6 +89,9 @@ proc parseArgs(): Config =
       of "--voices": result.voices = argv[i+1]
       of "--espeak-lib": result.espeakLib = argv[i+1]
       of "--espeak-data": result.espeakData = argv[i+1]
+      of "--g2p": result.g2p = argv[i+1]
+      of "--emotion": result.emotion = argv[i+1]
+      of "--style-offset": result.styleOffset = parseFloat(argv[i+1])
       else: discard
       i += 2
     of "--no-trim": result.trim = false; i += 1
@@ -202,14 +208,8 @@ proc main() =
     for n in vnames: echo n
     return
 
-  var voiceIdx = -1
-  for i, n in vnames:
-    if n == cfg.voice:
-      voiceIdx = i
-      break
-  if voiceIdx < 0:
-    stderr.writeLine("voice not found: " & cfg.voice & " (use --list)")
-    quit(2)
+  # With blends, exact voice name check may fail. 
+  # We just pass it down to forgeVoice later, but we can keep list logic intact.
 
   # espeak
   let exeDir = getAppDir()
@@ -252,10 +252,15 @@ proc main() =
     pos = endP
   let nPieces = pieces.len
 
+  var t_g2p_ms = 0
+  var t_synth_ms = 0
+
   for pi, piece in pieces:
-    let phonemes = phonemize(esp, piece)
+    let g2p_start = epochTime()
+    let phonemes = if cfg.g2p == "espeak": phonemize(esp, piece) else: misakiG2p(esp, piece)
+    t_g2p_ms += int((epochTime() - g2p_start) * 1000)
     if cfg.showPhonemes:
-      stderr.writeLine("PHONEMES: " & phonemes)
+      stderr.writeLine("PHONEMES: " & phonemes.strip())
     phonemeTotal += phonemes.len
     let batches = splitPhonemes(phonemes)
 
@@ -264,8 +269,23 @@ proc main() =
       if toks.len == 0: continue
       let idx = min(toks.len, 509)
       let base = idx * 256
-      var style = voicesNpz.entries[voiceIdx].data[base ..< base + 256]
-      var chunk = synthChunk(toks, style, cfg.speed.float32)
+      
+      let synth_start = epochTime()
+      
+      # forge voice array dynamically
+      let forged = forgeVoice(cfg.voice, voicesNpz)
+      var style = forged[base ..< base + 256]
+      
+      if cfg.emotion.len > 0:
+        applyEmotion(style, cfg.emotion, cfg.styleOffset)
+      
+      # clamp speed
+      var spd = cfg.speed.float32
+      if spd < 0.5f32: spd = 0.5f32
+      if spd > 2.0f32: spd = 2.0f32
+      
+      var chunk = synthChunk(toks, style, spd)
+      t_synth_ms += int((epochTime() - synth_start) * 1000)
       if cfg.trim:
         chunk = trimSilence(chunk)
       wav.putSamples(chunk)
@@ -293,7 +313,11 @@ proc main() =
       "startup_ms": startupMs,
       "synth_ms": synthMs,
       "rtf": round(synthMs.float / 1000.0 / max(audioLen, 0.001), 4),
-      "sample_rate": SampleRate
+      "sample_rate": SampleRate,
+      "profile": {
+        "g2p_ms": t_g2p_ms,
+        "synth_ms": t_synth_ms
+      }
     }
     stderr.writeLine(j.pretty())
 
