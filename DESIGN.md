@@ -66,11 +66,13 @@ The Kokoro config has `style_dim: 128`; `model.py` splits the 256-dim style
 as `ref_s[:, :128]` (timbre) + `ref_s[:, 128:]` (prosody/style). Stock never
 exposes the second half. In Nim:
 
-- Expose `--style-offset F` (add a scaled vector to the prosody half) and
-  `--emotion <name>` mapping to a learned/perpendicular offset in the
-  128-dim prosody subspace (e.g. `angry`, `whisper`, `cheerful`, `sad`,
-  `calm`) — port a small hand-set of offsets by fitting to the existing
-  voices' prosody halves (PCA direction per emotion is acceptable).
+- Expose `--style-offset F` (add a scaled vector to the prosody half).
+- Support data-driven emotions via `--emotion-file <path>` (defaults to `src/emotions.json`). 
+  The file is a JSON mapping emotion names (e.g. `angry`, `whisper`, `cheerful`, `sad`, `calm`) 
+  to an array of exactly 128 float offsets for the prosody half.
+- If the file is missing or invalid, it emits a warning and falls back to a builtin 
+  hardcoded directional offset (`applyEmotion`).
+- `--emotion <name>` selects the offset vector which is then multiplied by `style-offset`.
 - Must not change the timbre half (voice stays recognizable).
 - Success: `--emotion cheerful` vs baseline on the same sentence differs
   measurably in pitch/energy (not bit-identical) and transcribes the same

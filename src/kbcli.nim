@@ -17,8 +17,8 @@
 ## Long-form is native: text is spoken in phoneme batches of <=510 tokens,
 ## streamed straight to the output file — no in-memory ceiling.
 
-import std/[os, strutils, streams, times, math, json, algorithm, posix]
-import ./espeak, ./vocab, ./npz, ./onnx, ./trim, ./phonemize, ./misaki_g2p, ./voiceforge, ./emotion
+import std/[os, strutils, streams, times, math, json, algorithm, posix, tables]
+import ./espeak, ./vocab, ./npz, ./onnx, ./trim, ./phonemize, ./misaki_g2p, ./voiceforge, ./emotion, ./emotions
 
 const
   SampleRate = 24000
@@ -43,6 +43,7 @@ type
     listOnly: bool
     g2p: string
     emotion: string
+    emotionFile: string
     styleOffset: float
 
   WavWriter = object
@@ -69,7 +70,7 @@ proc defaultPaths(): tuple[model: string, voices: string] =
 
 proc parseArgs(): Config =
   result = Config(voice: "af_bella", outFile: "out.wav", speed: 1.0,
-                  trim: true, pauses: true, g2p: "misaki", styleOffset: 1.0)
+                  trim: true, pauses: true, g2p: "misaki", styleOffset: 1.0, emotionFile: "src/emotions.json")
   let argv = commandLineParams()
   var positionals: seq[string]
   var i = 0
@@ -77,7 +78,7 @@ proc parseArgs(): Config =
     let a = argv[i]
     case a
     of "--voice", "--out", "--speed", "--threads", "--model", "--voices",
-       "--espeak-lib", "--espeak-data", "--g2p", "--emotion", "--style-offset":
+       "--espeak-lib", "--espeak-data", "--g2p", "--emotion", "--emotion-file", "--style-offset":
       if i + 1 >= argv.len:
         quit("missing value for " & a)
       case a
@@ -91,6 +92,7 @@ proc parseArgs(): Config =
       of "--espeak-data": result.espeakData = argv[i+1]
       of "--g2p": result.g2p = argv[i+1]
       of "--emotion": result.emotion = argv[i+1]
+      of "--emotion-file": result.emotionFile = argv[i+1]
       of "--style-offset": result.styleOffset = parseFloat(argv[i+1])
       else: discard
       i += 2
@@ -255,6 +257,15 @@ proc main() =
   var t_g2p_ms = 0
   var t_synth_ms = 0
 
+  var globalEmTableLoaded = false
+  var globalEmTable: Table[string, seq[float32]]
+  if cfg.emotion.len > 0:
+    try:
+      globalEmTable = loadEmotions(cfg.emotionFile)
+      globalEmTableLoaded = true
+    except Exception as e:
+      stderr.writeLine("warning: emotion file " & cfg.emotionFile & " not found or valid, using builtin fallback (" & e.msg & ")")
+
   for pi, piece in pieces:
     let g2p_start = epochTime()
     let phonemes = if cfg.g2p == "espeak": phonemize(esp, piece) else: misakiG2p(esp, piece)
@@ -277,7 +288,17 @@ proc main() =
       var style = forged[base ..< base + 256]
       
       if cfg.emotion.len > 0:
-        applyEmotion(style, cfg.emotion, cfg.styleOffset)
+        var appliedNew = false
+        if globalEmTableLoaded:
+          try:
+            applyEmotionVector(style, cfg.emotion, cfg.styleOffset, globalEmTable)
+            appliedNew = true
+          except Exception as e:
+            # this shouldn't happen unless emotion name is unknown, fallback
+            stderr.writeLine("warning: emotion error: " & e.msg)
+        
+        if not appliedNew:
+          applyEmotion(style, cfg.emotion, cfg.styleOffset)
       
       # clamp speed
       var spd = cfg.speed.float32
