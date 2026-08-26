@@ -2,3 +2,6 @@ bin/
 *.wav
 *.o
 nimcache/
+vendor/libonnxruntime*.so*
+vendor/espeak-ng-data/
+vendor/libespeak-ng.so*
