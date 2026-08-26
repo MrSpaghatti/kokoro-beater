@@ -86,47 +86,41 @@ exposes the second half. In Nim:
 - Goal: `startup_ms` under ~350ms, RTF ≤ 0.16 on 12 cores, long-form
   (≥1h audio) with memory flat.
 
-## Verification (run these in the repo; fixtures make it self-contained)
+## Verification (what YOU must run — source + compile only)
 
-Fixture files (checked in, generated from the reference implementations):
-- `tests/fixtures/espeak_phonemes.txt` — kokoro-onnx `tokenizer.phonemize` output for
-  three test strings (the byte-exact legacy target).
-- `tests/fixtures/misaki_phonemes.txt` — misaki `en.G2P` output for the same strings
-  (the byte-exact misaki target).
-- `tests/fixtures/reference.wav` — kokoro-onnx `create("Hello, world! This is a test
-  for kokoro.", "af_bella")` 16-bit mono 24 kHz (the bit-exact audio target).
+The runtime needs heavy vendor binaries (`libonnxruntime*.so`, `libespeak-ng*`,
+`espeak-ng-data/`) that are NOT in the repo (gitignored, ~44MB). They exist
+only on the author's machine. **In this sandbox you CANNOT run the binary
+end-to-end.** Your verification is:
 
 ```bash
-NIM=./bin/kokoro-beater
-# 1. legacy espeak parity — phonemes must equal the fixture value exactly
-"$NIM" --g2p espeak --phonemes "$(head -1 <(cut -f2 tests/fixtures/espeak_phonemes.txt))" --out /tmp/esp.wav
-#    or compare key strings: the `misread` line must equal the fixture
-MISREAD=$(grep -P '^misread\t' tests/fixtures/espeak_phonemes.txt | cut -f2)
-[ "$("$NIM" --g2p espeak --phonemes 'boogeyman any more' 2>&1 | grep -oP 'PHONEMES: \K.*')" = "$MISREAD" ]
+# 1. COMPILE — must succeed:
+nim c -d:release --mm:arc -o:bin/kokoro-beater src/kbcli.nim
+#    (write a minimal stub in tests/ if vendor files are needed at compile time
+#     — but src/*.nim must typecheck clean; if a module needs the model at
+#     runtime only, that's fine.)
 
-# 2. audio regression — compare to the checked-in reference wav
-"$NIM" --g2p espeak "Hello, world! This is a test for kokoro." --out /tmp/reg.wav
-#    correlation vs tests/fixtures/reference.wav must be 1.000000
-#    (python: numpy corrcoef on int16→float — same length, same samples)
-
-# 3. misaki G2P — phonemes must equal tests/fixtures/misaki_phonemes.txt (`misaki` line)
-"$NIM" --g2p misaki --phonemes "boogeyman any more"
-#    and must DIFFER from the espeak fixture (that difference is the whole point)
-
-# 4. voice blend
-"$NIM" --voice '0.5*af_bella+0.5*am_onyx' "Hi there" --out /tmp/blend.wav --json
-#    audio must exist, RMS within 2x either parent
-
-# 5. emotion — differs from baseline but transcribes the same words
-"$NIM" --emotion cheerful "I can hardly believe it" --out /tmp/emo.wav --json
-"$NIM"                      "I can hardly believe it" --out /tmp/base.wav --json
-#    corr(emo, base) < 0.99
+# 2. FIXTURE-CONTRACT — your new modules must be structured so the audio
+#    verification (run by the AUTHOR on HIS machine) uses these fixtures:
+#    - --g2p espeak --phonemes 'boogeyman any more' output ==
+#      tests/fixtures/espeak_phonemes.txt line 'misread'
+#    - --g2p misaki --phonemes 'boogeyman any more' output ==
+#      tests/fixtures/misaki_phonemes.txt line 'misread'
+#    - audio corr vs reference.wav == 1.0 (legacy mode)
+#    Make the phoneme strings a PURE function (no model dependency) so a
+#    tiny unit test can assert them WITHOUT the runtime. Add
+#    tests/t_g2p.nim that imports your module and checks the two fixture
+#    strings directly (pure Nim, no vendor needed). Compile+run that.
 ```
 
-The audio correlation check needs a tiny helper; a Nim test at `tests/corr.nim` (or a
-`tests/verify.sh` using `python3` only if a system python is present — prefer pure Nim)
-is acceptable. Keep ALL verification commands relative to the repo — no absolute
-paths, no dependence on `~/Downloads/audiobook` (that dir does not exist in CI).
+Fixture files (checked in):
+- `tests/fixtures/espeak_phonemes.txt` — kokoro-onnx `tokenizer.phonemize` targets.
+- `tests/fixtures/misaki_phonemes.txt` — misaki 0.9.4 `en.G2P(version='0.2.0')`
+  targets (unk='❓'), for `hello/misread/quote` strings.
+- `tests/fixtures/reference.wav` — bit-exact audio target (author runs the corr).
+
+**Do NOT attempt to run the full binary** if vendor/ is missing; that's expected.
+Your job is: correct, compiling Nim source + the pure-function G2P unit test.
 
 ## Deliverables
 
