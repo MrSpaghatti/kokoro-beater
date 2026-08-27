@@ -69,7 +69,13 @@ exposes the second half. In Nim:
 - Expose `--style-offset F` (add a scaled vector to the prosody half).
 - Support data-driven emotions via `--emotion-file <path>` (defaults to `src/emotions.json`). 
   The file is a JSON mapping emotion names (e.g. `angry`, `whisper`, `cheerful`, `sad`, `calm`) 
-  to an array of exactly 128 float offsets for the prosody half.
+  to an array of exactly 128 float offsets for the prosody half. These vectors are now 
+  PCA-fitted from the real 54 voices' prosody halves (see `tools/fit_emotions.nim`). The mappings are:
+  - `cheerful`: +PC1
+  - `sad`: -PC1
+  - `angry`: +PC2
+  - `calm`: -PC2
+  - `whisper`: +PC3
 - If the file is missing or invalid, it emits a warning and falls back to a builtin 
   hardcoded directional offset (`applyEmotion`).
 - `--emotion <name>` selects the offset vector which is then multiplied by `style-offset`.

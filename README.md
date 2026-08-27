@@ -41,9 +41,9 @@ bin/kokoro-beater "Hello, world!" --voice af_bella --out hello.wav
    full sequence.
 6. **trim.nim** — librosa.effects.trim replica (frame RMS 2048/512, top_db=60).
 7. **kbcli.nim** — CLI: text argv→join or stdin; `--voice/--speed/--out/
-   --list/--phonemes/--json/--no-trim/--no-pause`. Long-form splits text at
-   sentence boundaries, streams each phoneme batch straight to the WAV — no
-   in-memory ceiling.
+   --list/--phonemes/--json/--no-trim/--no-pause/--emotion/--style-offset/--emotion-file`. 
+   Long-form splits text at sentence boundaries, streams each phoneme batch straight to the WAV — no
+   in-memory ceiling. The emotions are PCA-derived from the real voices' prosody data.
 
 ## Feed contract (the hard part — all verified)
 
