@@ -45,6 +45,12 @@ proc tokenize*(v: Vocab, phonemes: string): seq[int64] =
 proc splitPhonemes*(phonemes: string): seq[string] =
   ## Port of Kokoro._split_phonemes: split on `.,!?;` keeping the delimiters,
   ## accumulate into batches capped at 510 phoneme chars.
+  ##
+  ## Hard cap: a part that ALONE exceeds MaxPhonemeLength (e.g. a long run of
+  ## unpunctuated text — "fox fox fox ...") is subdivided at spaces before
+  ## batching, so no batch ever exceeds 510 chars. The python reference
+  ## instead truncates silently in _create_audio (phonemes[:510]), dropping
+  ## the tail; we split instead so no text is lost.
   var parts: seq[string]
   var cur = newStringOfCap(64)
   for ch in phonemes:
@@ -61,6 +67,24 @@ proc splitPhonemes*(phonemes: string): seq[string] =
   for part in parts:
     let p = part.strip()
     if p.len == 0: continue
+    if p.len >= MaxPhonemeLength:
+      # oversized unpunctuated run: flush current, subdivide p on spaces
+      if current.strip().len > 0:
+        batches.add current.strip()
+        current = ""
+      var sub = newStringOfCap(64)
+      for w in p.splitWhitespace:
+        if w.len == 0: continue
+        if sub.len + w.len + 1 >= MaxPhonemeLength:
+          if sub.strip().len > 0:
+            batches.add sub.strip()
+          sub = w
+        else:
+          if sub.len > 0: sub.add ' '
+          sub.add w
+      if sub.strip().len > 0:
+        batches.add sub.strip()
+      continue
     if current.len + p.len + 1 >= MaxPhonemeLength:
       if current.strip().len > 0: batches.add current.strip()
       current = p
