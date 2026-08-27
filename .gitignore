@@ -9,3 +9,4 @@ tools/fit_emotions
 tests/t_emotions
 tests/t_g2p
 tests/t_profile
+tests/t_vocab
