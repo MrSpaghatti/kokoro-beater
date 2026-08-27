@@ -4,4 +4,8 @@ bin/
 nimcache/
 vendor/libonnxruntime*.so*
 vendor/espeak-ng-data/
-vendor/libespeak-ng.so*tools/fit_emotions
+vendor/libespeak-ng.so*
+tools/fit_emotions
+tests/t_emotions
+tests/t_g2p
+tests/t_profile

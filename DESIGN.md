@@ -90,9 +90,9 @@ exposes the second half. In Nim:
   ORT) so a full book streams without RAM growth.
 - Add a `--speed F` sanity clamp (0.5..2.0, python parity).
 - Add `--g2p` (above) and a `--profile` flag that prints per-stage ms
-  (g2p/synth/trim/write) in the `--json` output.
+  (g2p/synth/trim/write) in the `--json` output (COMPLETE). Also includes `peak_rss_kb` for memory tracking.
 - Goal: `startup_ms` under ~350ms, RTF ≤ 0.16 on 12 cores, long-form
-  (≥1h audio) with memory flat.
+  (≥1h audio) with memory flat. The author must run `--bench` locally with vendor files present to verify these runtime targets.
 
 ## Verification (what YOU must run — source + compile only)
 

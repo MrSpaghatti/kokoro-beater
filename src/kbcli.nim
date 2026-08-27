@@ -20,7 +20,55 @@
 import std/[os, strutils, streams, times, math, json, algorithm, posix, tables]
 import ./espeak, ./vocab, ./npz, ./onnx, ./trim, ./phonemize, ./misaki_g2p, ./voiceforge, ./emotion, ./emotions
 
+proc peakRssKb*(): int =
+  var usage: Rusage
+  if getrusage(RUSAGE_SELF, addr usage) == 0:
+    return int(usage.ru_maxrss)
+  return 0
+
+proc formatBenchReport*(textChars: int, audioSeconds: float64, startupMs: int, rtf: float64, peakRssKb: int, g2pMs, synthMs, trimMs, writeMs: int): string =
+  result = "bench: text_chars=" & $textChars & " audio_seconds=" & formatFloat(audioSeconds, ffDecimal, 2) & " startup_ms=" & $startupMs & " rtf=" & formatFloat(rtf, ffDecimal, 4) & " peak_rss_kb=" & $peakRssKb & "\n" &
+           "bench: g2p_ms=" & $g2pMs & " synth_ms=" & $synthMs & " trim_ms=" & $trimMs & " write_ms=" & $writeMs
+
+proc buildProfileJson*(voice, model: string, textChars, phonemes, chunks, tokens: int, audioSeconds: float64, startupMs, synthMs: int, rtf: float64, sampleRate, peakRssKb, g2pMs, t_synthMs, trimMs, writeMs: int): JsonNode =
+  result = %*{
+    "voice": voice,
+    "model": model,
+    "text_chars": textChars,
+    "phonemes": phonemes,
+    "chunks": chunks,
+    "tokens": tokens,
+    "audio_seconds": round(audioSeconds, 4),
+    "startup_ms": startupMs,
+    "synth_ms": synthMs,
+    "rtf": round(rtf, 4),
+    "sample_rate": sampleRate,
+    "peak_rss_kb": peakRssKb,
+    "profile": {
+      "g2p_ms": g2pMs,
+      "synth_ms": t_synthMs,
+      "trim_ms": trimMs,
+      "write_ms": writeMs
+    }
+  }
+
 const
+  BenchText* = """
+It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife.
+However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered the rightful property of some one or other of their daughters.
+"My dear Mr. Bennet," said his lady to him one day, "have you heard that Netherfield Park is let at last?"
+Mr. Bennet replied that he had not.
+"But it is," returned she; "for Mrs. Long has just been here, and she told me all about it."
+Mr. Bennet made no answer.
+"Do you not want to know who has taken it?" cried his wife impatiently.
+"You want to tell me, and I have no objection to hearing it."
+This was invitation enough.
+"Why, my dear, you must know, Mrs. Long says that Netherfield is taken by a young man of large fortune from the north of England; that he came down on Monday in a chaise and four to see the place, and was so much delighted with it, that he agreed with Mr. Morris immediately; that he is to take possession before Michaelmas, and some of his servants are to be in the house by the end of next week."
+"What is his name?"
+"Bingley."
+"Is he married or single?"
+"""
+
   SampleRate = 24000
   VoiceFloats = 510 * 256      # per-voice style array, in floats
   TextChunkChars = 2048        # max text fed to espeak per call (memory + rate)
@@ -45,6 +93,7 @@ type
     emotion: string
     emotionFile: string
     styleOffset: float
+    bench: bool
 
   WavWriter = object
     f: File
@@ -101,13 +150,16 @@ proc parseArgs(): Config =
     of "--phonemes": result.showPhonemes = true; i += 1
     of "--json": result.jsonOn = true; i += 1
     of "--list": result.listOnly = true; i += 1
+    of "--bench": result.bench = true; i += 1
     else:
       if a.len > 1 and a[0] == '-':
         quit("unknown option: " & a)
       positionals.add a
       i += 1
   result.text = positionals.join(" ")
-  if result.text.len == 0:
+  if result.bench:
+    result.text = BenchText
+  elif result.text.len == 0:
     result.text = readAll(stdin)
 
 proc pauseAfter(phonemes: string): int =
@@ -227,7 +279,6 @@ proc main() =
   let vocab = newVocab()
   var wav: WavWriter
   openWav(wav, cfg.outFile, SampleRate)
-  defer: finishWav(wav)
 
   var phonemeTotal = 0
   var tokenTotal = 0
@@ -256,6 +307,8 @@ proc main() =
 
   var t_g2p_ms = 0
   var t_synth_ms = 0
+  var t_trim_ms = 0
+  var t_write_ms = 0
 
   var globalEmTableLoaded = false
   var globalEmTable: Table[string, seq[float32]]
@@ -308,38 +361,36 @@ proc main() =
       var chunk = synthChunk(toks, style, spd)
       t_synth_ms += int((epochTime() - synth_start) * 1000)
       if cfg.trim:
+        let trim_start = epochTime()
         chunk = trimSilence(chunk)
+        t_trim_ms += int((epochTime() - trim_start) * 1000)
+      let write_start = epochTime()
       wav.putSamples(chunk)
+      t_write_ms += int((epochTime() - write_start) * 1000)
       inc chunkCount
       tokenTotal += toks.len
       let isLastOverall = pi == pieces.len - 1 and bi == batches.len - 1
       if cfg.pauses and not isLastOverall:
+        let pause_start = epochTime()
         wav.putSilence(pauseAfter(batch))
+        t_write_ms += int((epochTime() - pause_start) * 1000)
       if chunkCount mod 20 == 0 and not cfg.jsonOn:
         stderr.writeLine("[" & $chunkCount & " chunks...]")
+
+  let finish_start = epochTime()
+  finishWav(wav)
+  t_write_ms += int((epochTime() - finish_start) * 1000)
 
   let synthMs = int((epochTime() - t1) * 1000)
   let audioSamples = wav.dataBytes div 2
   let audioLen = float64(audioSamples) / float(SampleRate)
 
-  if cfg.jsonOn:
-    let j = %*{
-      "voice": cfg.voice,
-      "model": modelPath,
-      "text_chars": cfg.text.len,
-      "phonemes": phonemeTotal,
-      "chunks": chunkCount,
-      "tokens": tokenTotal,
-      "audio_seconds": round(audioLen, 4),
-      "startup_ms": startupMs,
-      "synth_ms": synthMs,
-      "rtf": round(synthMs.float / 1000.0 / max(audioLen, 0.001), 4),
-      "sample_rate": SampleRate,
-      "profile": {
-        "g2p_ms": t_g2p_ms,
-        "synth_ms": t_synth_ms
-      }
-    }
+  let rtfVal = synthMs.float / 1000.0 / max(audioLen, 0.001)
+
+  if cfg.bench:
+    stderr.writeLine(formatBenchReport(cfg.text.len, audioLen, startupMs, rtfVal, peakRssKb(), t_g2p_ms, t_synth_ms, t_trim_ms, t_write_ms))
+  elif cfg.jsonOn:
+    let j = buildProfileJson(cfg.voice, modelPath, cfg.text.len, phonemeTotal, chunkCount, tokenTotal, audioLen, startupMs, synthMs, rtfVal, SampleRate, peakRssKb(), t_g2p_ms, t_synth_ms, t_trim_ms, t_write_ms)
     stderr.writeLine(j.pretty())
 
   stderr.writeLine("wrote " & cfg.outFile & " (" & $audioSamples & " samples, " &
