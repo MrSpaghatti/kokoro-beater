@@ -48,6 +48,28 @@ check("misaki differs from espeak legacy",
       $not(boogeymanAnyMore == "bˈuːɡɪmən ˌɛni mˈɔːɹ"),
       "true")
 
+# Fixture-contract check
+# We check that the espeak/misaki target fixture files exist, are not empty,
+# and contain the expected number of target labelled lines (3).
+# Note: The actual string VALUES inside `espeak_phonemes.txt` and the audio 
+# correlation are verified by the author on their machine with the heavy ONNX
+# runtime present. This pure test only verifies the structural contract.
+let espeakFix = currentSourcePath().parentDir / "fixtures" / "espeak_phonemes.txt"
+let misakiFix = currentSourcePath().parentDir / "fixtures" / "misaki_phonemes.txt"
+
+check("espeak fixture exists", $fileExists(espeakFix), "true")
+check("misaki fixture exists", $fileExists(misakiFix), "true")
+
+if fileExists(espeakFix) and fileExists(misakiFix):
+  let eLines = readFile(espeakFix).strip().splitLines()
+  let mLines = readFile(misakiFix).strip().splitLines()
+  
+  check("espeak fixture has 3 lines", $(eLines.len == 3), "true")
+  check("misaki fixture has 3 lines", $(mLines.len == 3), "true")
+else:
+  check("espeak fixture exists", "false", "true")
+  check("misaki fixture exists", "false", "true")
+
 if failures == 0:
   echo "\nALL TESTS PASSED"
   quit(0)

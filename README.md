@@ -40,10 +40,32 @@ bin/kokoro-beater "Hello, world!" --voice af_bella --out hello.wav
    **Tokens are padded** `[0, ...tokens, 0]` — the model's reshape needs the
    full sequence.
 6. **trim.nim** — librosa.effects.trim replica (frame RMS 2048/512, top_db=60).
-7. **kbcli.nim** — CLI: text argv→join or stdin; `--voice/--speed/--out/
-   --list/--phonemes/--json/--bench/--no-trim/--no-pause/--emotion/--style-offset/--emotion-file`. 
+7. **kbcli.nim** — CLI surface for TTS generation. 
    Long-form splits text at sentence boundaries, streams each phoneme batch straight to the WAV — no
    in-memory ceiling. The emotions are PCA-derived from the real voices' prosody data.
+
+## CLI Flags Reference
+
+| Flag | Description |
+|---|---|
+| `--voice <name\|expr>` | Voice name (e.g. `af_bella`) or blend expression (e.g. `0.5*af_bella+0.5*am_onyx`). |
+| `--out <file>` | Path for the output `.wav` file (default: `out.wav`). |
+| `--speed <float>` | Speech speed multiplier, clamped to `0.5..2.0` bounds (default: `1.0`). |
+| `--threads <int>` | Number of ONNX threads to use. |
+| `--model <path>` | Path to the ONNX model (`kokoro-v1.0.onnx`). |
+| `--voices <path>` | Path to the voices bin file (`voices-v1.0.bin`). |
+| `--list` | Lists all available voices in the `.bin` container and exits. |
+| `--json` | Outputs JSON profiling metrics instead of standard text logs. |
+| `--phonemes` | Prints the generated phonemes to stderr. |
+| `--g2p <mode>` | G2P engine to use: `misaki` (default) or `espeak` (legacy bit-parity). |
+| `--emotion <name>` | Name of the emotion to apply (e.g., `cheerful`, `angry`). |
+| `--emotion-file <path>` | Path to the emotions JSON file (default: `src/emotions.json`). |
+| `--style-offset <float>` | Multiplier for the emotion vector offset (default: `1.0`). |
+| `--no-trim` | Disables trailing/leading silence trimming on audio chunks. |
+| `--no-pause` | Disables inter-sentence silence pauses. |
+| `--bench` | Runs performance benchmarks for metrics and prints a report. |
+| `--espeak-lib <path>` | Override path to the `libespeak-ng` shared library. |
+| `--espeak-data <path>` | Override path to the `espeak-ng-data` directory. |
 
 ## Feed contract (the hard part — all verified)
 
