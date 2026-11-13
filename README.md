@@ -33,10 +33,28 @@ with `make test-espeak`.
 | | kokoro-onnx (python) | kokoro-beater (nim) |
 |---|---|---|
 | Runtime deps | venv, numpy, onnxruntime, espeakng_loader | one ~300KB binary |
-| Cold start | 3-5s (python + imports) | ~400ms (ORT model load) |
-| RTF (R9700 12-core) | ~0.18 | ~0.159 |
+| Cold start | 3-5s (python + imports) | 0.41-0.50 s (ORT model load; benched 2026-11-13) |
+| RTF, 1258 chars -> 102.0 s audio | ~0.18 (not re-measured) | 0.186-0.191 (benched 2026-11-13) |
 | Long-form | in-memory concat | streaming to disk, no ceiling |
-| Audio parity | — | correlation 1.000000 vs python |
+| Audio parity | — | correlation 1.000000 vs python, measured 2026-11-07; not re-verified since |
+
+## Measured numbers, and how to reproduce them
+
+Host: raven (Ryzen 12-core, R9700 not used — this engine is CPU-only). Binary built by `make build`.
+One run is noise; each figure below is 3 runs.
+
+```bash
+# throughput: fixed bench text (1258 chars -> 102.02 s of audio)
+bin/kokoro-beater --bench --threads 4      # rtf 0.1859  startup 411 ms  peak rss 966 MB
+bin/kokoro-beater --bench --threads 8      # rtf 0.1869  startup 411 ms
+bin/kokoro-beater --bench                  # rtf 0.1907-0.2010 (ORT default thread count)
+
+# short-utterance cost is startup-dominated, not throughput-bound
+bin/kokoro-beater "Good evening." --out /tmp/s.wav --json   # startup ~430 ms, synth ~280 ms
+```
+
+Thread count matters: 4 and 8 beat the ORT default here. Numbers move with the text used, so quote
+the text and the flags with the number or the number means nothing.
 
 ## How it works
 
