@@ -12,6 +12,7 @@
 ##   --model PATH   override model onnx
 ##   --voices PATH  override voices npz
 ##   --json         emit stats as a JSON object on stderr
+##   --selfcheck    synthesize a fixed sentence, verify the WAV, exit 0/1
 ##
 ## Text comes from argv (joined) or from stdin when no positional text.
 ## Long-form is native: text is spoken in phoneme batches of <=510 tokens,
@@ -70,6 +71,11 @@ This was invitation enough.
 """
 
   SampleRate = 24000
+  DefaultOutFile = "out.wav"
+  SelfcheckText = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs."
+  SelfcheckMinSeconds = 1.0
+  SelfcheckMaxSeconds = 20.0
+  SelfcheckMinPeak = 3000
   VoiceFloats = 510 * 256      # per-voice style array, in floats
   TextChunkChars = 2048        # max text fed to espeak per call (memory + rate)
 
@@ -94,6 +100,7 @@ type
     emotionFile: string
     styleOffset: float
     bench: bool
+    selfcheck: bool
 
   WavWriter = object
     f: File
@@ -107,6 +114,7 @@ proc defaultPaths(): tuple[model: string, voices: string] =
   if existsEnv("KOKORO_MODELS"):
     candidates.add getEnv("KOKORO_MODELS")
   candidates.add exeDir / "models"
+  candidates.add exeDir.parentDir / "models"
   candidates.add getCurrentDir() / "models"
   candidates.add home / "Downloads" / "audiobook" / "models"
   for dir in candidates:
@@ -118,7 +126,7 @@ proc defaultPaths(): tuple[model: string, voices: string] =
     "kokoro model+voices not found (pass --model/--voices or set KOKORO_MODELS)")
 
 proc parseArgs(): Config =
-  result = Config(voice: "af_bella", outFile: "out.wav", speed: 1.0,
+  result = Config(voice: "af_bella", outFile: DefaultOutFile, speed: 1.0,
                   trim: true, pauses: true, g2p: "misaki", styleOffset: 1.0, emotionFile: "src/emotions.json")
   let argv = commandLineParams()
   var positionals: seq[string]
@@ -151,13 +159,18 @@ proc parseArgs(): Config =
     of "--json": result.jsonOn = true; i += 1
     of "--list": result.listOnly = true; i += 1
     of "--bench": result.bench = true; i += 1
+    of "--selfcheck": result.selfcheck = true; i += 1
     else:
       if a.len > 1 and a[0] == '-':
         quit("unknown option: " & a)
       positionals.add a
       i += 1
   result.text = positionals.join(" ")
-  if result.bench:
+  if result.selfcheck:
+    result.text = SelfcheckText
+    if result.outFile == DefaultOutFile:
+      result.outFile = getTempDir() / "kokoro-selfcheck.wav"
+  elif result.bench:
     result.text = BenchText
   elif result.text.len == 0:
     result.text = readAll(stdin)
@@ -239,6 +252,63 @@ proc finishWav(w: var WavWriter) =
   w.f.setFilePos(40)
   w.putU32LE(uint32(w.dataBytes))
   w.f.close()
+
+# --- selfcheck -------------------------------------------------------------
+
+proc le16(s: string, off: int): int =
+  int(uint8(s[off])) or (int(uint8(s[off+1])) shl 8)
+
+proc le32(s: string, off: int): int =
+  int(uint8(s[off])) or (int(uint8(s[off+1])) shl 8) or
+    (int(uint8(s[off+2])) shl 16) or (int(uint8(s[off+3])) shl 24)
+
+proc verifyWav*(path: string): seq[tuple[name: string, ok: bool, detail: string]] =
+  ## Reads a synthesized WAV back and asserts the properties a broken synth
+  ## would violate. KOKORO_SELFCHECK_BLIND=1 inverts the peak requirement, so
+  ## a passing run and a blind run differ -- the check is demonstrably able to
+  ## fail rather than decorative.
+  result.add ("file exists", fileExists(path), path)
+  if not fileExists(path):
+    return
+  let raw = readFile(path)
+  result.add ("length >= 44 (canonical header)", raw.len >= 44, $raw.len & " bytes")
+  if raw.len < 44: return
+  result.add ("RIFF/WAVE signature", raw[0..3] == "RIFF" and raw[8..11] == "WAVE",
+              raw[0..3] & "/" & raw[8..11])
+  result.add ("fmt chunk", raw[12..15] == "fmt ", raw[12..15])
+  result.add ("PCM (format tag 1)", le16(raw, 20) == 1, $le16(raw, 20))
+  result.add ("mono", le16(raw, 22) == 1, $le16(raw, 22))
+  result.add ("sample rate 24000", le32(raw, 24) == SampleRate, $le32(raw, 24))
+  result.add ("16 bits per sample", le16(raw, 34) == 16, $le16(raw, 34))
+  result.add ("data chunk", raw[36..39] == "data", raw[36..39])
+  let dataBytes = le32(raw, 40)
+  result.add ("data size matches file", 44 + dataBytes == raw.len,
+              $dataBytes & " vs " & $(raw.len - 44))
+  let seconds = dataBytes.float / 2.0 / SampleRate.float
+  result.add ("duration in [" & $SelfcheckMinSeconds & ", " & $SelfcheckMaxSeconds & "] s",
+              seconds >= SelfcheckMinSeconds and seconds <= SelfcheckMaxSeconds,
+              formatFloat(seconds, ffDecimal, 2) & " s")
+  var peak = 0
+  var i = 44
+  while i + 1 < raw.len:
+    var v = le16(raw, i)
+    if v > 32767: v -= 65536
+    let a = abs(v)
+    if a > peak: peak = a
+    i += 2
+  let needPeak = if existsEnv("KOKORO_SELFCHECK_BLIND"): 40000 else: SelfcheckMinPeak
+  result.add ("peak amplitude >= " & $needPeak & " (not silence)", peak >= needPeak, $peak)
+
+proc reportSelfcheck(checks: seq[tuple[name: string, ok: bool, detail: string]]): int =
+  var fails = 0
+  for c in checks:
+    stderr.writeLine((if c.ok: "PASS  " else: "FAIL  ") & c.name & " -- " & c.detail)
+    if not c.ok: inc fails
+  if fails == 0:
+    stderr.writeLine("SELFCHECK PASS (" & $checks.len & " checks)")
+  else:
+    stderr.writeLine("SELFCHECK FAIL (" & $fails & "/" & $checks.len & " failed)")
+  return if fails == 0: 0 else: 1
 
 # --- main ------------------------------------------------------------------
 
@@ -395,6 +465,11 @@ proc main() =
 
   stderr.writeLine("wrote " & cfg.outFile & " (" & $audioSamples & " samples, " &
                    formatFloat(audioLen, ffDecimal, 2) & " s)")
+
+  if cfg.selfcheck:
+    let code = reportSelfcheck(verifyWav(cfg.outFile))
+    removeFile(cfg.outFile)
+    quit(code)
 
 when isMainModule:
   main()

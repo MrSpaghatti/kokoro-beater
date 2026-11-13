@@ -8,6 +8,26 @@ no numpy/torch, and byte-identical audio output.
 bin/kokoro-beater "Hello, world!" --voice af_bella --out hello.wav
 ```
 
+## Build, test, run
+
+```bash
+make build        # -> bin/kokoro-beater (nim c -d:release --mm:arc)
+make models       # copy kokoro-v1.0.onnx + voices-v1.0.bin into ./models
+                  #   MODELS_SRC=/path/to/models to override; ./models is gitignored
+make test         # compile+run every assertion-bearing suite; nonzero exit on failure
+make selfcheck    # synth a fixed sentence and verify the WAV end to end
+make blind-check  # prove the selfcheck actually fails when blinded
+```
+
+**Build into `bin/`.** The vendored `libespeak-ng` and `libonnxruntime` are resolved relative to the
+executable's own directory and its parent, so a binary built anywhere else dies asking for
+`KOKORO_ESPEAK_LIB` / `KOKORO_ONNX_LIB`. `make build` handles this; a bare `nim c` to another path
+does not.
+
+`make test` covers `t_vocab`, `t_g2p`, `t_emotions`, `t_profile`, `t_voiceforge`. `t_espeak` is a
+debug harness that prints rather than asserts, so it is excluded from the suite and run separately
+with `make test-espeak`.
+
 ## Why it beats the Python path
 
 | | kokoro-onnx (python) | kokoro-beater (nim) |

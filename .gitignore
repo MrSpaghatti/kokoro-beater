@@ -9,3 +9,4 @@ tools/fit_emotions
 # compiled test binaries - the *.nim sources next to them must stay tracked
 tests/t_*
 !tests/t_*.nim
+models/
