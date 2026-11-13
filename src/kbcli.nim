@@ -125,9 +125,24 @@ proc defaultPaths(): tuple[model: string, voices: string] =
   raise newException(IOError,
     "kokoro model+voices not found (pass --model/--voices or set KOKORO_MODELS)")
 
+proc resolveAsset*(name: string): string =
+  ## Data files ship beside the sources (src/misaki_dict.txt, src/emotions.json)
+  ## but the binary is normally run from bin/ or from a *different* working
+  ## directory entirely. Resolve relative to the executable first, cwd last --
+  ## a cwd-relative default is a portability bug, not a default.
+  let exeDir = getAppDir()
+  for d in [exeDir / "src", exeDir.parentDir / "src", exeDir, exeDir.parentDir]:
+    let p = d / name
+    if fileExists(p): return p
+  for d in [getCurrentDir() / "src", getCurrentDir()]:
+    let p = d / name
+    if fileExists(p): return p
+  return name
+
 proc parseArgs(): Config =
   result = Config(voice: "af_bella", outFile: DefaultOutFile, speed: 1.0,
-                  trim: true, pauses: true, g2p: "misaki", styleOffset: 1.0, emotionFile: "src/emotions.json")
+                  trim: true, pauses: true, g2p: "misaki", styleOffset: 1.0,
+                  emotionFile: resolveAsset("emotions.json"))
   let argv = commandLineParams()
   var positionals: seq[string]
   var i = 0
@@ -391,7 +406,8 @@ proc main() =
 
   for pi, piece in pieces:
     let g2p_start = epochTime()
-    let phonemes = if cfg.g2p == "espeak": phonemize(esp, piece) else: misakiG2p(esp, piece)
+    let phonemes = if cfg.g2p == "espeak": phonemize(esp, piece)
+                   else: misakiG2p(esp, piece, dictPath = resolveAsset("misaki_dict.txt"))
     t_g2p_ms += int((epochTime() - g2p_start) * 1000)
     if cfg.showPhonemes:
       stderr.writeLine("PHONEMES: " & phonemes.strip())
