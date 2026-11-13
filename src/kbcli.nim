@@ -101,6 +101,7 @@ type
     styleOffset: float
     bench: bool
     selfcheck: bool
+    serve: bool
 
   WavWriter = object
     f: File
@@ -175,6 +176,7 @@ proc parseArgs(): Config =
     of "--list": result.listOnly = true; i += 1
     of "--bench": result.bench = true; i += 1
     of "--selfcheck": result.selfcheck = true; i += 1
+    of "--serve": result.serve = true; i += 1
     else:
       if a.len > 1 and a[0] == '-':
         quit("unknown option: " & a)
@@ -185,6 +187,9 @@ proc parseArgs(): Config =
     result.text = SelfcheckText
     if result.outFile == DefaultOutFile:
       result.outFile = getTempDir() / "kokoro-selfcheck.wav"
+  elif result.serve:
+    # requests arrive as JSON lines on stdin; nothing to read here
+    result.text = ""
   elif result.bench:
     result.text = BenchText
   elif result.text.len == 0:
@@ -327,53 +332,86 @@ proc reportSelfcheck(checks: seq[tuple[name: string, ok: bool, detail: string]])
 
 # --- main ------------------------------------------------------------------
 
-proc main() =
-  let cfg = parseArgs()
+# --- resident engine -------------------------------------------------------
 
-  var modelPath, voicesPath: string
+type
+  EngineState = object
+    esp: LibEspeak
+    vocab: Vocab
+    voices: Npz
+    vnames: seq[string]
+    modelPath: string
+    emTable: Table[string, seq[float32]]
+    emLoaded: bool
+    startupMs: int
+
+  RenderStats = object
+    textChars: int
+    phonemeTotal: int
+    tokenTotal: int
+    chunkCount: int
+    audioSamples: int
+    g2pMs: int
+    synthMs: int
+    trimMs: int
+    writeMs: int
+    wallMs: int
+    audioSeconds: float64
+
+proc resolveModelPaths(cfg: Config): tuple[model: string, voices: string] =
   if cfg.model.len > 0:
-    modelPath = cfg.model
-    voicesPath = if cfg.voices.len > 0: cfg.voices else: cfg.model.parentDir / "voices-v1.0.bin"
+    result.model = cfg.model
+    result.voices = if cfg.voices.len > 0: cfg.voices else: cfg.model.parentDir / "voices-v1.0.bin"
   else:
-    (modelPath, voicesPath) = defaultPaths()
+    (result.model, result.voices) = defaultPaths()
 
+proc listVoiceNames(cfg: Config): seq[string] =
+  let (_, voicesPath) = resolveModelPaths(cfg)
+  let npz = readNpz(voicesPath, VoiceFloats)
+  for e in npz.entries: result.add e.name
+  result.sort()
+
+proc loadEngine(cfg: Config): EngineState =
+  ## Everything expensive, loaded once. --serve reuses this for every request;
+  ## single-shot mode pays it per process (that is the 0.45 s startup).
+  let (modelPath, voicesPath) = resolveModelPaths(cfg)
   let t0 = epochTime()
+  result.modelPath = modelPath
+  result.voices = readNpz(voicesPath, VoiceFloats)
+  for x in result.voices.entries: result.vnames.add x.name
+  result.vnames.sort()
 
-  var voicesNpz = readNpz(voicesPath, VoiceFloats)
-  var vnames: seq[string]
-  for e in voicesNpz.entries: vnames.add e.name
-  vnames.sort()
-  if cfg.listOnly:
-    for n in vnames: echo n
-    return
-
-  # With blends, exact voice name check may fail. 
-  # We just pass it down to forgeVoice later, but we can keep list logic intact.
-
-  # espeak
   let exeDir = getAppDir()
   let espeakLib = if cfg.espeakLib.len > 0: cfg.espeakLib else: defaultEspeakLibrary(exeDir)
   let espeakData = if cfg.espeakData.len > 0: cfg.espeakData else: defaultEspeakData(exeDir)
-  var esp = loadEspeak(espeakLib)
-  esp.init(espeakData)
+  result.esp = loadEspeak(espeakLib)
+  result.esp.init(espeakData)
 
-  # onnx
   onnxStart(modelPath, cfg.threads)
-  let startupMs = int((epochTime() - t0) * 1000)
+  result.vocab = newVocab()   # default-init has an EMPTY table -> zero tokens
+  result.startupMs = int((epochTime() - t0) * 1000)
 
-  let vocab = newVocab()
+  if cfg.emotion.len > 0:
+    try:
+      result.emTable = loadEmotions(cfg.emotionFile)
+      result.emLoaded = true
+    except Exception as e:
+      stderr.writeLine("warning: emotion file " & cfg.emotionFile &
+                       " not found or valid, using builtin fallback (" & e.msg & ")")
+
+proc renderToFile(e: var EngineState, cfg: Config, text, outFile: string): RenderStats =
+  ## One text -> one WAV, start to finish. Single-shot mode, --selfcheck and
+  ## --serve all go through here, so there is exactly one synthesis path.
+  result.textChars = text.len
+  result.wallMs = 0
   var wav: WavWriter
-  openWav(wav, cfg.outFile, SampleRate)
+  openWav(wav, outFile, SampleRate)
 
-  var phonemeTotal = 0
-  var tokenTotal = 0
-  var chunkCount = 0
-  var textDone = 0
+  let wallStart = epochTime()
 
   # split text into espeak-sized pieces, keeping sentence boundaries
-  var t1 = epochTime()
   var pieces: seq[string]
-  let textLen = cfg.text.len
+  let textLen = text.len
   var pos = 0
   while pos < textLen:
     var endP = min(pos + TextChunkChars, textLen)
@@ -381,106 +419,161 @@ proc main() =
     if endP < textLen:
       var cut = -1
       for k in countdown(endP - 1, pos):
-        if cfg.text[k] in {'.', '!', '?', '\n'}:
+        if text[k] in {'.', '!', '?', '\n'}:
           cut = k + 1
           break
       if cut > 0:
         endP = cut
-    pieces.add cfg.text[pos ..< endP]
+    pieces.add text[pos ..< endP]
     pos = endP
-  let nPieces = pieces.len
-
-  var t_g2p_ms = 0
-  var t_synth_ms = 0
-  var t_trim_ms = 0
-  var t_write_ms = 0
-
-  var globalEmTableLoaded = false
-  var globalEmTable: Table[string, seq[float32]]
-  if cfg.emotion.len > 0:
-    try:
-      globalEmTable = loadEmotions(cfg.emotionFile)
-      globalEmTableLoaded = true
-    except Exception as e:
-      stderr.writeLine("warning: emotion file " & cfg.emotionFile & " not found or valid, using builtin fallback (" & e.msg & ")")
 
   for pi, piece in pieces:
     let g2p_start = epochTime()
-    let phonemes = if cfg.g2p == "espeak": phonemize(esp, piece)
-                   else: misakiG2p(esp, piece, dictPath = resolveAsset("misaki_dict.txt"))
-    t_g2p_ms += int((epochTime() - g2p_start) * 1000)
+    let phonemes = if cfg.g2p == "espeak": phonemize(e.esp, piece)
+                   else: misakiG2p(e.esp, piece, dictPath = resolveAsset("misaki_dict.txt"))
+    result.g2pMs += int((epochTime() - g2p_start) * 1000)
     if cfg.showPhonemes:
       stderr.writeLine("PHONEMES: " & phonemes.strip())
-    phonemeTotal += phonemes.len
+    result.phonemeTotal += phonemes.len
     let batches = splitPhonemes(phonemes)
 
     for bi, batch in batches:
-      let toks = vocab.tokenize(batch)
+      let toks = e.vocab.tokenize(batch)
       if toks.len == 0: continue
       let idx = min(toks.len, 509)
       let base = idx * 256
-      
+
       let synth_start = epochTime()
-      
+
       # forge voice array dynamically
-      let forged = forgeVoice(cfg.voice, voicesNpz)
+      let forged = forgeVoice(cfg.voice, e.voices)
       var style = forged[base ..< base + 256]
-      
+
       if cfg.emotion.len > 0:
         var appliedNew = false
-        if globalEmTableLoaded:
+        if e.emLoaded:
           try:
-            applyEmotionVector(style, cfg.emotion, cfg.styleOffset, globalEmTable)
+            applyEmotionVector(style, cfg.emotion, cfg.styleOffset, e.emTable)
             appliedNew = true
-          except Exception as e:
-            # this shouldn't happen unless emotion name is unknown, fallback
-            stderr.writeLine("warning: emotion error: " & e.msg)
-        
+          except Exception as ex:
+            stderr.writeLine("warning: emotion error: " & ex.msg)
         if not appliedNew:
           applyEmotion(style, cfg.emotion, cfg.styleOffset)
-      
+
       # clamp speed
       var spd = cfg.speed.float32
       if spd < 0.5f32: spd = 0.5f32
       if spd > 2.0f32: spd = 2.0f32
-      
+
       var chunk = synthChunk(toks, style, spd)
-      t_synth_ms += int((epochTime() - synth_start) * 1000)
+      result.synthMs += int((epochTime() - synth_start) * 1000)
       if cfg.trim:
         let trim_start = epochTime()
         chunk = trimSilence(chunk)
-        t_trim_ms += int((epochTime() - trim_start) * 1000)
+        result.trimMs += int((epochTime() - trim_start) * 1000)
       let write_start = epochTime()
       wav.putSamples(chunk)
-      t_write_ms += int((epochTime() - write_start) * 1000)
-      inc chunkCount
-      tokenTotal += toks.len
+      result.writeMs += int((epochTime() - write_start) * 1000)
+      inc result.chunkCount
+      result.tokenTotal += toks.len
       let isLastOverall = pi == pieces.len - 1 and bi == batches.len - 1
       if cfg.pauses and not isLastOverall:
         let pause_start = epochTime()
         wav.putSilence(pauseAfter(batch))
-        t_write_ms += int((epochTime() - pause_start) * 1000)
-      if chunkCount mod 20 == 0 and not cfg.jsonOn:
-        stderr.writeLine("[" & $chunkCount & " chunks...]")
+        result.writeMs += int((epochTime() - pause_start) * 1000)
+      if result.chunkCount mod 20 == 0 and not cfg.jsonOn:
+        stderr.writeLine("[" & $result.chunkCount & " chunks...]")
 
   let finish_start = epochTime()
   finishWav(wav)
-  t_write_ms += int((epochTime() - finish_start) * 1000)
+  result.writeMs += int((epochTime() - finish_start) * 1000)
 
-  let synthMs = int((epochTime() - t1) * 1000)
-  let audioSamples = wav.dataBytes div 2
-  let audioLen = float64(audioSamples) / float(SampleRate)
+  result.wallMs = int((epochTime() - wallStart) * 1000)
+  result.audioSamples = wav.dataBytes div 2
+  result.audioSeconds = float64(result.audioSamples) / float(SampleRate)
 
-  let rtfVal = synthMs.float / 1000.0 / max(audioLen, 0.001)
+proc rtfOf(s: RenderStats): float64 =
+  s.wallMs.float / 1000.0 / max(s.audioSeconds, 0.001)
+
+# --- resident mode (--serve) -----------------------------------------------
+#
+# One JSON object per line on stdin, one JSON object per line on stdout.
+#   {"text": "...", "out": "/path/x.wav", "voice": "bf_emma",
+#    "speed": 1.0, "emotion": "", "trim": true, "pauses": false}
+# -> {"ok": true, "out": ..., "samples": N, "seconds": s, "synth_ms": N, ...}
+# The model, espeak and the voice container are loaded ONCE for the whole
+# session, which removes the per-chunk process-startup cost entirely.
+# Timing/log lines go to stderr so stdout stays machine-readable.
+
+proc serveLoop(base: Config) =
+  var e = loadEngine(base)
+  var cfg = base
+  stderr.writeLine("SERVE READY startup_ms=" & $e.startupMs & " voices=" & $e.vnames.len)
+  stderr.flushFile()
+  for line in stdin.lines:
+    let s = line.strip()
+    if s.len == 0: continue
+    var req: JsonNode
+    try:
+      req = parseJson(s)
+    except CatchableError as ex:
+      stdout.writeLine($(%*{"ok": false, "error": "bad json: " & ex.msg}))
+      stdout.flushFile()
+      continue
+    if not req.hasKey("text") or not req.hasKey("out"):
+      stdout.writeLine($(%*{"ok": false, "error": "text and out are required"}))
+      stdout.flushFile()
+      continue
+    cfg.voice = if req.hasKey("voice"): req["voice"].getStr() else: base.voice
+    cfg.speed = if req.hasKey("speed"): req["speed"].getFloat().float32 else: base.speed
+    cfg.emotion = if req.hasKey("emotion"): req["emotion"].getStr() else: base.emotion
+    cfg.trim = if req.hasKey("trim"): req["trim"].getBool() else: base.trim
+    cfg.pauses = if req.hasKey("pauses"): req["pauses"].getBool() else: base.pauses
+    try:
+      let st = renderToFile(e, cfg, req["text"].getStr(), req["out"].getStr())
+      stdout.writeLine($(%*{"ok": true,
+                            "out": req["out"].getStr(),
+                            "samples": st.audioSamples,
+                            "seconds": st.audioSeconds,
+                            "chunks": st.chunkCount,
+                            "tokens": st.tokenTotal,
+                            "g2p_ms": st.g2pMs,
+                            "synth_ms": st.synthMs,
+                            "trim_ms": st.trimMs,
+                            "write_ms": st.writeMs,
+                            "wall_ms": st.wallMs}))
+    except CatchableError as ex:
+      stdout.writeLine($(%*{"ok": false, "error": ex.msg}))
+    stdout.flushFile()
+
+# --- entry point -----------------------------------------------------------
+
+proc main() =
+  let cfg = parseArgs()
+
+  if cfg.listOnly:
+    for n in listVoiceNames(cfg): echo n
+    return
+
+  if cfg.serve:
+    serveLoop(cfg)
+    return
+
+  var e = loadEngine(cfg)
+  let st = renderToFile(e, cfg, cfg.text, cfg.outFile)
 
   if cfg.bench:
-    stderr.writeLine(formatBenchReport(cfg.text.len, audioLen, startupMs, rtfVal, peakRssKb(), t_g2p_ms, t_synth_ms, t_trim_ms, t_write_ms))
+    stderr.writeLine(formatBenchReport(st.textChars, st.audioSeconds, e.startupMs, rtfOf(st),
+                                       peakRssKb(), st.g2pMs, st.synthMs, st.trimMs, st.writeMs))
   elif cfg.jsonOn:
-    let j = buildProfileJson(cfg.voice, modelPath, cfg.text.len, phonemeTotal, chunkCount, tokenTotal, audioLen, startupMs, synthMs, rtfVal, SampleRate, peakRssKb(), t_g2p_ms, t_synth_ms, t_trim_ms, t_write_ms)
+    let j = buildProfileJson(cfg.voice, e.modelPath, st.textChars, st.phonemeTotal,
+                             st.chunkCount, st.tokenTotal, st.audioSeconds, e.startupMs,
+                             st.wallMs, rtfOf(st), SampleRate, peakRssKb(), st.g2pMs,
+                             st.synthMs, st.trimMs, st.writeMs)
     stderr.writeLine(j.pretty())
 
-  stderr.writeLine("wrote " & cfg.outFile & " (" & $audioSamples & " samples, " &
-                   formatFloat(audioLen, ffDecimal, 2) & " s)")
+  stderr.writeLine("wrote " & cfg.outFile & " (" & $st.audioSamples & " samples, " &
+                   formatFloat(st.audioSeconds, ffDecimal, 2) & " s)")
 
   if cfg.selfcheck:
     let code = reportSelfcheck(verifyWav(cfg.outFile))

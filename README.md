@@ -28,6 +28,33 @@ does not.
 debug harness that prints rather than asserts, so it is excluded from the suite and run separately
 with `make test-espeak`.
 
+## Resident mode (`--serve`)
+
+One process, many utterances. The model, espeak and the voice container load once, which removes
+the per-invocation startup from every request after the first.
+
+```bash
+bin/kokoro-beater --serve
+{"text":"Hello there.","voice":"bf_emma","out":"/tmp/a.wav"}   # -> one JSON response line
+{"text":"Second one.","voice":"am_onyx","out":"/tmp/b.wav"}    # -> one JSON response line
+```
+
+Request keys: `text` and `out` (required), `voice`, `speed`, `emotion`, `trim`, `pauses`.
+Response: `{"ok":true,"out":...,"samples":N,"seconds":s,"chunks":N,"tokens":N,"g2p_ms":...,
+"synth_ms":...,"trim_ms":...,"write_ms":...,"wall_ms":...}` or `{"ok":false,"error":"..."}`.
+stdout carries only responses; `SERVE READY startup_ms=<n> voices=<n>` and warnings go to stderr.
+
+Measured 2026-11-13, 10 short sentences (~2.5 s of audio each), same binary:
+
+| mode | total | per utterance |
+|---|---|---|
+| 10 separate processes | 14.73 s | ~1.47 s (493 ms of it is startup) |
+| one `--serve` process | 7.74 s | 0.60–0.88 s |
+
+Output is byte-identical between the two modes (10/10 files `cmp` clean), and identical again to a
+whole-chapter render through the audiobook pipeline. Resident mode is what close-to-real-time use
+needs; single-shot is the thing for one-off commands.
+
 ## Why it beats the Python path
 
 | | kokoro-onnx (python) | kokoro-beater (nim) |
